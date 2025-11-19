@@ -1,0 +1,574 @@
+theory J1939_ADBE
+
+begin
+
+/* =========================================================
+   Overview
+   ---------------------------------------------------------
+   This script models a J1939-ADBE scheme with three ECUs
+   (ECU1, ECU2, ECU3) and two logical groups (Group1, Group2).
+   Groups are realized by ADBE's receiver set S; pp/i/bulletin
+   board are global.
+
+   Key evolution follows the *new* design:
+     K_t := HKDF(<seed, delta_t>, ...)
+   where 'seed' is a per-vehicle private value (never sent)
+   and 'delta_t' is a fresh per-round randomness delivered
+   via ADBE ciphertext CT to the intended receiver set S.
+
+   Phases modeled:
+     - init()   : first session-key distribution
+     - next()   : subsequent session-key distribution (rollover)
+
+   Security goals (unchanged):
+     - Executability (exists-trace)
+     - Injective Agreement (Running/Commit + AAD binding)
+     - Session Secrecy (absence of K(<...>) unless revealed)
+     - Known-Key Security (learning one accepted key does not
+       break distinct others)
+     - Forward Secrecy (past accepted keys remain secret after
+       later LTK compromise, unless revealed)
+   ========================================================= */
+
+
+/* ================================
+   0) Function Signatures
+   --------------------------------
+   - Setup/UskGen/UpkGen: system and ECU key generation.
+   - Encode: builds the signature AAD with (group, <ctr, phase>).
+   - ADBEEncrypt/Sign/Decrypt: abstract ADBE oracles.
+   - HKDF derives (k_ses, k_sync) from <seed, delta> labelled
+     by 'former'/'latter' to obtain two outputs.
+   - 'seed_init()' is a private constructor standing for the
+     per-vehicle seed, never transmitted.
+   - Phases: init(), next().
+   ================================ */
+
+functions:
+  Setup/2,                        // Setup(lambda, L) -> pp
+  UskGen/3, UpkGen/3,             // ECU long-term key generation
+  ecu1/0[private], ecu2/0[private], ecu3/0[private],     // ECU identifiers
+  group1/0[private], group2/0[private],                  // Group identifiers
+  seed_init/0[private],           // Per-vehicle private seed (never sent)
+  Encode/2,                       // AAD constructor: Encode(group, <ctr, phase>)
+  ADBEEncrypt/4, ADBESign/3,      // ADBE encrypt/sign
+  ADBEDecrypt/5[private],         // ADBE decrypt bound to group (private equation below)
+  HKDF/2, former/0, latter/0,     // HKDF(<seed,delta>, former/latter) -> k_ses/k_sync
+  init/0, next/0                  // Phase tags
+
+/* ADBE encryption/decryption correctness (delta recovery). */
+equations:
+  ADBEDecrypt(pp, upk_s, usk_r, ADBEEncrypt(pp, upk_s, group, delta), group) = delta
+
+
+/* =========================================================
+   1) Manufacturing & Provisioning
+   ---------------------------------------------------------
+   One-time system setup; one-time ECU provisioning. Each ECU
+   stores the private 'seed' and initial counters; no rolling
+   token is kept in state anymore.
+   ========================================================= */
+
+/* System setup publishes pp once. */
+rule VehicleManufacture:
+let pp = Setup(~lamda, ~L) in
+  [Fr(~lamda), Fr(~L)]
+  --[SetupDone()]->
+  [!PP($pp)]
+
+/* ECU1 manufacture: keys, membership bindings, initial seed/counters. */
+rule Ecu1Manufacture:
+let
+  usk = UskGen($pp, ecu1(), ~tj)
+  upk = UpkGen($pp, ecu1(), ~tj)
+  seed = seed_init()
+in
+  [Fr(~tj), !PP($pp)]
+  --[ECU1_INIT(ecu1()),
+     BindKey(usk, $upk, ecu1(), group1()),
+     BindKey(usk, $upk, ecu1(), group2())]->
+  [ECU1_group1_state1($pp, usk, $upk, ecu1(), ~tj, group1(), seed),
+   ECU1_group2_state1($pp, usk, $upk, ecu1(), ~tj, group2(), seed),
+   Out(<$upk, ecu1(), group1()>),
+   Out(<$upk, ecu1(), group2()>),
+   !BindPk(ecu1(), $upk)]
+
+/* ECU2 manufacture: in both groups. */
+rule Ecu2Manufacture:
+let
+  usk = UskGen($pp, ecu2(), ~tj)
+  upk = UpkGen($pp, ecu2(), ~tj)
+  seed = seed_init()
+in
+  [Fr(~tj), !PP($pp)]
+  --[ECU2_INIT(ecu2()),
+     BindKey(usk, $upk, ecu2(), group1()),
+     BindKey(usk, $upk, ecu2(), group2())]->
+  [ECU2_group1_state1($pp, usk, $upk, ecu2(), ~tj, group1(), seed),
+   ECU2_group2_state1($pp, usk, $upk, ecu2(), ~tj, group2(), seed),
+   Out(<$upk, ecu2(), group1()>),
+   Out(<$upk, ecu2(), group2()>),
+   !BindPk(ecu2(), $upk)]
+
+/* ECU3 manufacture: in Group2 only. */
+rule Ecu3Manufacture:
+let
+  usk = UskGen($pp, ecu3(), ~tj)
+  upk = UpkGen($pp, ecu3(), ~tj)
+  seed = seed_init()
+in
+  [Fr(~tj), !PP($pp)]
+  --[ECU3_INIT(ecu3()),
+     BindKey(usk, $upk, ecu3(), group2())]->
+  [ECU3_group2_state1($pp, usk, $upk, ecu3(), ~tj, group2(), seed),
+   Out(<$upk, ecu3(), group2()>),
+   !BindPk(ecu3(), $upk)]
+
+
+/* =========================================================
+   2) Phase A - Initial Distribution (init)
+   ---------------------------------------------------------
+   Leader samples delta, ADBE-broadcasts CT, derives keys from
+   HKDF(<seed,delta>, ...). Receivers verify/signature, decrypt
+   delta, derive same keys, and commit.
+   ========================================================= */
+
+/* ECU1 -> Group1: first distribution broadcast. */
+rule Ecu1FirstDistribute_Group1:
+let
+  ph    = init()
+  aad   = Encode(group1(), <~ctr, ph>)
+  delta = ~delta
+  ct    = ADBEEncrypt($pp, $upk, group1(), delta)
+  sign  = ADBESign(ct, aad, usk)
+  k_ses = HKDF(<seed, delta>, former)
+  k_sync= HKDF(<seed, delta>, latter)
+in
+  [ECU1_group1_state1($pp, usk, $upk, ecu1(), tj, group1(), seed),
+   Fr(~delta), Fr(~ctr)]
+  --[Sign(ct, group1(), ecu1()),
+     ECU_Group_KeyReady(ecu1(), group1(), k_ses, k_sync, ph),
+     Group1_INIT(group1(), k_ses, k_sync, ph),
+     Running(ecu1(), group1(), <ct, ~ctr, ecu1(), $upk>, ph)]->
+  [ECU1_group1_state2($pp, usk, $upk, ecu1(), tj, group1(), seed, k_ses, k_sync),
+   Out(<ct, sign, group1(), ~ctr, ecu1()>)]
+
+
+/* ECU1 -> Group2: first distribution broadcast. */
+rule Ecu1FirstDistribute_Group2:
+let
+  ph    = init()
+  aad   = Encode(group2(), <~ctr, ph>)
+  delta = ~delta
+  ct    = ADBEEncrypt($pp, $upk, group2(), delta)
+  sign  = ADBESign(ct, aad, usk)
+  k_ses = HKDF(<seed, delta>, former)
+  k_sync= HKDF(<seed, delta>, latter)
+in
+  [ECU1_group2_state1($pp, usk, $upk, ecu1(), tj, group2(), seed),
+   Fr(~delta), Fr(~ctr)]
+  --[Sign(ct, group2(), ecu1()),
+     ECU_Group_KeyReady(ecu1(), group2(), k_ses, k_sync, ph),
+     Group2_INIT(group2(), k_ses, k_sync, ph),
+     Running(ecu1(), group2(), <ct, ~ctr, ecu1(), $upk>, ph)]->
+  [ECU1_group2_state2($pp, usk, $upk, ecu1(), tj, group2(), seed, k_ses, k_sync),
+   Out(<ct, sign, group2(), ~ctr, ecu1()>)]
+
+
+/* ECU2 <- Group1: verify, decrypt delta, derive keys, commit. */
+rule Ecu2FirstAccept_Group1:
+let
+  ph     = init()
+  aad    = Encode(group1(), <ctr_r, ph>)
+  delta  = ADBEDecrypt($pp, $upk_r, usk, ct_r, group1())
+  k_ses  = HKDF(<seed, delta>, former)
+  k_sync = HKDF(<seed, delta>, latter)
+in
+  [ECU2_group1_state1($pp, usk, $upk, ecu2(), tj, group1(), seed),
+   In(<ct_r, ADBESign(ct_r, Encode(group1(), <ctr_r, ph>), usk_s), group1(), ctr_r, ecu1()>),
+   In(<$upk_r, ecu1(), group1()>), !BindPk(ecu1(), $upk_r)]
+  --[Verify(ADBESign(ct_r, Encode(group1(), <ctr_r, ph>), usk_s),
+            ct_r, ctr_r, group1(), ph, $upk_r),
+     ECU_Group_KeyReady(ecu2(), group1(), k_ses, k_sync, ph),
+     Commit(ecu2(), ecu1(), group1(), <ct_r, ctr_r, ecu1(), $upk_r>, ph)]->
+  [ECU2_group1_state2($pp, usk, $upk, ecu2(), tj, group1(), seed, k_ses, k_sync)]
+
+
+/* ECU2 <- Group2: verify, decrypt delta, derive keys, commit. */
+rule Ecu2FirstAccept_Group2:
+let
+  ph     = init()
+  aad    = Encode(group2(), <ctr_r, ph>)
+  delta  = ADBEDecrypt($pp, $upk_r, usk, ct_r, group2())
+  k_ses  = HKDF(<seed, delta>, former)
+  k_sync = HKDF(<seed, delta>, latter)
+in
+  [ECU2_group2_state1($pp, usk, $upk, ecu2(), tj, group2(), seed),
+   In(<ct_r, ADBESign(ct_r, Encode(group2(), <ctr_r, ph>), usk_s), group2(), ctr_r, ecu1()>),
+   In(<$upk_r, ecu1(), group2()>), !BindPk(ecu1(), $upk_r)]
+  --[Verify(ADBESign(ct_r, Encode(group2(), <ctr_r, ph>), usk_s),
+            ct_r, ctr_r, group2(), ph, $upk_r),
+     ECU_Group_KeyReady(ecu2(), group2(), k_ses, k_sync, ph),
+     Commit(ecu2(), ecu1(), group2(), <ct_r, ctr_r, ecu1(), $upk_r>, ph)]->
+  [ECU2_group2_state2($pp, usk, $upk, ecu2(), tj, group2(), seed, k_ses, k_sync)]
+
+
+/* ECU3 <- Group2: verify, decrypt delta, derive keys, commit. */
+rule Ecu3FirstAccept_Group2:
+let
+  ph     = init()
+  aad    = Encode(group2(), <ctr_r, ph>)
+  delta  = ADBEDecrypt($pp, $upk_r, usk, ct_r, group2())
+  k_ses  = HKDF(<seed, delta>, former)
+  k_sync = HKDF(<seed, delta>, latter)
+in
+  [ECU3_group2_state1($pp, usk, $upk, ecu3(), tj, group2(), seed),
+   In(<ct_r, ADBESign(ct_r, Encode(group2(), <ctr_r, ph>), usk_s), group2(), ctr_r, ecu1()>),
+   In(<$upk_r, ecu1(), group2()>), !BindPk(ecu1(), $upk_r)]
+  --[Verify(ADBESign(ct_r, Encode(group2(), <ctr_r, ph>), usk_s),
+            ct_r, ctr_r, group2(), ph, $upk_r),
+     ECU_Group_KeyReady(ecu3(), group2(), k_ses, k_sync, ph),
+     Commit(ecu3(), ecu1(), group2(), <ct_r, ctr_r, ecu1(), $upk_r>, ph)]->
+  [ECU3_group2_state2($pp, usk, $upk, ecu3(), tj, group2(), seed, k_ses, k_sync)]
+
+
+/* =========================================================
+   3) Phase B - Subsequent Distribution (next)
+   ---------------------------------------------------------
+   Same structure with phase tag next(). We keep CLEAR/INIT
+   lifecycle events to emphasize rollover, although keys are
+   derived directly from <seed, delta>.
+   ========================================================= */
+
+/* ECU1 -> Group1: subsequent distribution, with CLEAR/INIT. */
+rule Ecu1NextDistribute_Group1:
+let
+  ph_old = init()
+  ph_new = next()
+  aad    = Encode(group1(), <~ctr, ph_new>)
+  delta  = ~delta
+  ct     = ADBEEncrypt($pp, $upk, group1(), delta)
+  sign   = ADBESign(ct, aad, usk)
+  k_ses  = HKDF(<seed, delta>, former)
+  k_sync = HKDF(<seed, delta>, latter)
+in
+  [ECU1_group1_state2($pp, usk, $upk, ecu1(), tj, group1(), seed, k_ses_old, k_sync_old),
+   Fr(~delta), Fr(~ctr)]
+  --[Sign(ct, group1(), ecu1()),
+     ECU_Group_KeyReady(ecu1(), group1(), k_ses, k_sync, ph_new),
+     Group1_CLEAR(group1(), k_ses_old, k_sync_old, ph_old),
+     Group1_INIT(group1(), k_ses, k_sync, ph_new),
+     Running(ecu1(), group1(), <ct, ~ctr, ecu1(), $upk>, ph_new)]->
+  [ECU1_group1_state3($pp, usk, $upk, ecu1(), tj, group1(), seed, k_ses, k_sync),
+   Out(<ct, sign, group1(), ~ctr, ecu1()>)]
+
+
+/* ECU1 -> Group2: subsequent distribution, with CLEAR/INIT. */
+rule Ecu1NextDistribute_Group2:
+let
+  ph_old = init()
+  ph_new = next()
+  aad    = Encode(group2(), <~ctr, ph_new>)
+  delta  = ~delta
+  ct     = ADBEEncrypt($pp, $upk, group2(), delta)
+  sign   = ADBESign(ct, aad, usk)
+  k_ses  = HKDF(<seed, delta>, former)
+  k_sync = HKDF(<seed, delta>, latter)
+in
+  [ECU1_group2_state2($pp, usk, $upk, ecu1(), tj, group2(), seed, k_ses_old, k_sync_old),
+   Fr(~delta), Fr(~ctr)]
+  --[Sign(ct, group2(), ecu1()),
+     ECU_Group_KeyReady(ecu1(), group2(), k_ses, k_sync, ph_new),
+     Group2_CLEAR(group2(), k_ses_old, k_sync_old, ph_old),
+     Group2_INIT(group2(), k_ses, k_sync, ph_new),
+     Running(ecu1(), group2(), <ct, ~ctr, ecu1(), $upk>, ph_new)]->
+  [ECU1_group2_state3($pp, usk, $upk, ecu1(), tj, group2(), seed, k_ses, k_sync),
+   Out(<ct, sign, group2(), ~ctr, ecu1()>)]
+
+
+/* ECU2 <- Group1: accept next-phase keys. */
+rule Ecu2NextAccept_Group1:
+let
+  ph_new = next()
+  aad    = Encode(group1(), <ctr_r, ph_new>)
+  delta  = ADBEDecrypt($pp, $upk_r, usk, ct_r, group1())
+  k_ses  = HKDF(<seed, delta>, former)
+  k_sync = HKDF(<seed, delta>, latter)
+in
+  [ECU2_group1_state2($pp, usk, $upk, ecu2(), tj, group1(), seed, k_ses_old, k_sync_old),
+   In(<ct_r, ADBESign(ct_r, Encode(group1(), <ctr_r, ph_new>), usk_s), group1(), ctr_r, ecu1()>),
+   In(<$upk_r, ecu1(), group1()>), !BindPk(ecu1(), $upk_r)]
+  --[Verify(ADBESign(ct_r, Encode(group1(), <ctr_r, ph_new>), usk_s),
+            ct_r, ctr_r, group1(), ph_new, $upk_r),
+     ECU_Group_KeyReady(ecu2(), group1(), k_ses, k_sync, ph_new),
+     Commit(ecu2(), ecu1(), group1(), <ct_r, ctr_r, ecu1(), $upk_r>, ph_new)]->
+  [ECU2_group1_state3($pp, usk, $upk, ecu2(), tj, group1(), seed, k_ses, k_sync)]
+
+
+/* ECU2 <- Group2: accept next-phase keys. */
+rule Ecu2NextAccept_Group2:
+let
+  ph_new = next()
+  aad    = Encode(group2(), <ctr_r, ph_new>)
+  delta  = ADBEDecrypt($pp, $upk_r, usk, ct_r, group2())
+  k_ses  = HKDF(<seed, delta>, former)
+  k_sync = HKDF(<seed, delta>, latter)
+in
+  [ECU2_group2_state2($pp, usk, $upk, ecu2(), tj, group2(), seed, k_ses_old, k_sync_old),
+   In(<ct_r, ADBESign(ct_r, Encode(group2(), <ctr_r, ph_new>), usk_s), group2(), ctr_r, ecu1()>),
+   In(<$upk_r, ecu1(), group2()>), !BindPk(ecu1(), $upk_r)]
+  --[Verify(ADBESign(ct_r, Encode(group2(), <ctr_r, ph_new>), usk_s),
+            ct_r, ctr_r, group2(), ph_new, $upk_r),
+     ECU_Group_KeyReady(ecu2(), group2(), k_ses, k_sync, ph_new),
+     Commit(ecu2(), ecu1(), group2(), <ct_r, ctr_r, ecu1(), $upk_r>, ph_new)]->
+  [ECU2_group2_state3($pp, usk, $upk, ecu2(), tj, group2(), seed, k_ses, k_sync)]
+
+
+/* ECU3 <- Group2: accept next-phase keys. */
+rule Ecu3NextAccept_Group2:
+let
+  ph_new = next()
+  aad    = Encode(group2(), <ctr_r, ph_new>)
+  delta  = ADBEDecrypt($pp, $upk_r, usk, ct_r, group2())
+  k_ses  = HKDF(<seed, delta>, former)
+  k_sync = HKDF(<seed, delta>, latter)
+in
+  [ECU3_group2_state2($pp, usk, $upk, ecu3(), tj, group2(), seed, k_ses_old, k_sync_old),
+   In(<ct_r, ADBESign(ct_r, Encode(group2(), <ctr_r, ph_new>), usk_s), group2(), ctr_r, ecu1()>),
+   In(<$upk_r, ecu1(), group2()>), !BindPk(ecu1(), $upk_r)]
+  --[Verify(ADBESign(ct_r, Encode(group2(), <ctr_r, ph_new>), usk_s),
+            ct_r, ctr_r, group2(), ph_new, $upk_r),
+     ECU_Group_KeyReady(ecu3(), group2(), k_ses, k_sync, ph_new),
+     Commit(ecu3(), ecu1(), group2(), <ct_r, ctr_r, ecu1(), $upk_r>, ph_new)]->
+  [ECU3_group2_state3($pp, usk, $upk, ecu3(), tj, group2(), seed, k_ses, k_sync)]
+
+
+/* =========================================================
+   4) Adversary Oracles (controlled reveals)
+   ---------------------------------------------------------
+   Same structure as before, but referencing the new state
+   facts (state2: after init; state3: after next).
+   ========================================================= */
+
+/* INIT PHASE - reveal session keys for ECU2/Group1 after init. */
+rule RevealSessionKeys_init_ECU2_Group1:
+  [ECU2_group1_state2($pp, usk, $upk, ecu2(), tj, group1(), seed, k_ses, k_sync), In(reveal_session)]
+  --[Session_reveal(k_ses, k_sync) ]->
+  [Out(<k_ses, k_sync>)]
+
+/* INIT PHASE - reveal ECU2 long-term key. */
+rule RevealLTK_init_ECU2:
+  [ECU2_group1_state2($pp, usk, $upk, ecu2(), tj, group1(), seed, k_ses, k_sync), In(reveal_LTK)]
+  --[LTKReveal(usk)]->
+  [Out(usk)]
+
+/* NEXT PHASE - reveal session keys for ECU2/Group1 after next. */
+rule RevealSessionKeys_next_ECU2_Group1:
+  [ECU2_group1_state3($pp, usk, $upk, ecu2(), tj, group1(), seed, k_ses, k_sync), In(reveal_session)]
+  --[Session_reveal(k_ses, k_sync)]->
+  [Out(<k_ses, k_sync>)]
+
+/* NEXT PHASE - reveal ECU2 long-term key. */
+rule RevealLTK_next_ECU2:
+  [ECU2_group1_state3($pp, usk, $upk, ecu2(), tj, group1(), seed, k_ses, k_sync), In(reveal_LTK)]
+  --[LTKReveal(usk)]->
+  [Out(usk)]
+
+
+/* =========================================================
+   5) Well-Formedness Restrictions
+   ---------------------------------------------------------
+   Uniqueness of setup/provisioning; Verify must correspond
+   to a matching Sign with consistent tuple and proper key
+   binding between signer's usk and verified upk.
+   ========================================================= */
+
+restriction SetupVehicleUnique:
+  "All #i #j. SetupDone()@#i & SetupDone()@#j ==> #i = #j"
+
+restriction SetupECU1Unique:
+  "All #i #j. ECU1_INIT(ecu1())@#i & ECU1_INIT(ecu1())@#j ==> #i = #j"
+
+restriction SetupECU2Unique:
+  "All #i #j. ECU2_INIT(ecu2())@#i & ECU2_INIT(ecu2())@#j ==> #i = #j"
+
+restriction SetupECU3Unique:
+  "All #i #j. ECU3_INIT(ecu3())@#i & ECU3_INIT(ecu3())@#j ==> #i = #j"
+
+/* Signature correctness & binding to signer's key. */
+restriction ADBEVerifySignature:
+"
+  All ct_s group_s ctr_s ph_s usk_s
+      ct_r ctr_r group_r ph_r upk_r #i.
+    Verify(ADBESign(ct_s, Encode(group_s, <ctr_s, ph_s>), usk_s),
+           ct_r, ctr_r, group_r, ph_r, upk_r) @ #i
+  ==>
+    ct_s = ct_r &
+    group_s = group_r &
+    ctr_s = ctr_r &
+    ph_s = ph_r &
+    Ex ecu_id_s #j. BindKey(usk_s, upk_r, ecu_id_s, group_r) @ #j
+"
+
+
+/* =========================================================
+   6) Security Properties
+   ---------------------------------------------------------
+   Updated to reference 'state2/state3' (post-init/post-next)
+   and keep the same proof ideas as the original script.
+   ========================================================= */
+
+/* ---- Phase A: init() ---- */
+
+/* Executability (init): all parties accept consistent init keys. */
+lemma Exec_Init_GroupKeys_OK:
+exists-trace
+"
+  Ex #i #j #k #l #m #n #o #p #q #r k_ses_g1 k_sync_g1 k_ses_g2 k_sync_g2.
+    ECU_Group_KeyReady(ecu1(), group1(), k_ses_g1, k_sync_g1, init()) @ #i &
+    ECU_Group_KeyReady(ecu1(), group2(), k_ses_g2, k_sync_g2, init()) @ #j &
+    ECU_Group_KeyReady(ecu2(), group1(), k_ses_g1, k_sync_g1, init()) @ #k &
+    ECU_Group_KeyReady(ecu2(), group2(), k_ses_g2, k_sync_g2, init()) @ #l &
+    ECU_Group_KeyReady(ecu3(), group2(), k_ses_g2, k_sync_g2, init()) @ #m &
+    not (k_ses_g1 = k_ses_g2) & not (k_sync_g1 = k_sync_g2) &
+    ECU1_INIT(ecu1()) @ #n & ECU2_INIT(ecu2()) @ #o & ECU3_INIT(ecu3()) @ #p &
+    Group1_INIT(group1(), k_ses_g1, k_sync_g1, init()) @ #q &
+    Group2_INIT(group2(), k_ses_g2, k_sync_g2, init()) @ #r
+"
+
+/* Non-executability (init): ECU3 is not a member of Group1. */
+lemma Exec_Init_NonMember_ECU3_NotInGroup1:
+"
+  not (Ex #i #j #k k_ses_g1 k_sync_g1.
+        ECU_Group_KeyReady(ecu3(), group1(), k_ses_g1, k_sync_g1, init()) @ #i &
+        ECU3_INIT(ecu3()) @ #j &
+        Group1_INIT(group1(), k_ses_g1, k_sync_g1, init()) @ #k)
+"
+
+/* Injective Agreement (init). */
+lemma InjectiveAgreement_Init_Group1:
+"
+  All ct ctr upk #i.
+    Commit(ecu2(), ecu1(), group1(), <ct, ctr, ecu1(), upk>, init()) @ #i
+  ==>
+  ( Ex #j. Running(ecu1(), group1(), <ct, ctr, ecu1(), upk>, init()) @ #j
+    & #j < #i
+    & not (Ex ct2 ctr2 #i2.
+             Commit(ecu2(), ecu1(), group1(), <ct2, ctr2, ecu1(), upk>, init()) @ #i2
+             & not (#i2 = #i))
+  )
+"
+
+/* Session Secrecy (init). */
+lemma SessionSecrecy_Init_Group1:
+"
+  not ( Ex k_ses k_sync #i #j.
+          K(<k_ses,k_sync>) @ #i
+          & ECU_Group_KeyReady(ecu2(), group1(), k_ses, k_sync, init()) @ #j
+          & not (Ex #k. Session_reveal(k_ses, k_sync) @ #k)
+          & not (Ex usk #l. LTKReveal(usk) @ #l)
+      )
+"
+
+/* Known-Key Security (init). */
+lemma KnownKeySecurity_Init_Group1:
+"
+  All k_ses_old k_sync_old #i.
+    ECU_Group_KeyReady(ecu2(), group1(), k_ses_old, k_sync_old, init()) @ #i
+  ==>
+  not ( Ex k_ses k_sync #j.
+          K(<k_ses, k_sync>) @ #j
+          & Ex #k. ECU_Group_KeyReady(ecu2(), group1(), k_ses, k_sync, init()) @ #k
+          & #i < #k
+          & not (k_ses = k_ses_old)
+          & not (k_sync = k_sync_old)
+          & not (Ex #l. Session_reveal(k_ses, k_sync) @ #l)
+          & not (Ex usk #m. LTKReveal(usk) @ #m)
+      )
+"
+
+/* Forward Secrecy (init). */
+lemma ForwardSecrecy_Init_Group1:
+"
+  All usk #i. LTKReveal(usk) @ #i
+  ==>
+  not ( Ex k_ses k_sync #j.
+          K(<k_ses,k_sync>) @ #j
+          & Ex #k. ECU_Group_KeyReady(ecu2(), group1(), k_ses, k_sync, init()) @ #k
+          & #k < #i
+          & not (Ex #l. Session_reveal(k_ses, k_sync) @ #l)
+      )
+"
+
+
+/* ---- Phase B: next() ---- */
+
+/* Executability (next): rollover with inequality and lifecycle. */
+lemma Exec_Next_Rollover_OK:
+exists-trace
+"
+  Ex #i #j #k k_ses_new k_sync_new k_ses_old k_sync_old ph_old.
+    ECU_Group_KeyReady(ecu1(), group1(), k_ses_new, k_sync_new, next()) @ #i &
+    ECU_Group_KeyReady(ecu2(), group1(), k_ses_new, k_sync_new, next()) @ #j &
+    Group1_CLEAR(group1(), k_ses_old, k_sync_old, ph_old) @ #k &
+    Group1_INIT(group1(), k_ses_new, k_sync_new, next()) @ #k &
+    not (k_ses_new = k_ses_old) & not (k_sync_new = k_sync_old)
+"
+
+/* Injective Agreement (next). */
+lemma InjectiveAgreement_Next_Group1:
+"
+  All ct ctr upk #i.
+    Commit(ecu2(), ecu1(), group1(), <ct, ctr, ecu1(), upk>, next()) @ #i
+  ==>
+  ( Ex #j. Running(ecu1(), group1(), <ct, ctr, ecu1(), upk>, next()) @ #j
+    & #j < #i
+    & not (Ex ct2 ctr2 #i2.
+             Commit(ecu2(), ecu1(), group1(), <ct2, ctr2, ecu1(), upk>, next()) @ #i2
+             & not (#i2 = #i))
+  )
+"
+
+/* Session Secrecy (next). */
+lemma SessionSecrecy_Next_Group1:
+"
+  not ( Ex k_ses k_sync #i #j.
+          K(<k_ses,k_sync>) @ #i
+          & ECU_Group_KeyReady(ecu2(), group1(), k_ses, k_sync, next()) @ #j
+          & not (Ex #k. Session_reveal(k_ses, k_sync) @ #k)
+          & not (Ex usk #l. LTKReveal(usk) @ #l)
+      )
+"
+
+/* Known-Key Security (next). */
+lemma KnownKeySecurity_Next_Group1:
+"
+  All k_ses_old k_sync_old #i.
+    ECU_Group_KeyReady(ecu2(), group1(), k_ses_old, k_sync_old, next()) @ #i
+  ==>
+  not ( Ex k_ses k_sync #j.
+          K(<k_ses, k_sync>) @ #j
+          & Ex #k. ECU_Group_KeyReady(ecu2(), group1(), k_ses, k_sync, next()) @ #k
+          & #i < #k
+          & not (k_ses = k_ses_old)
+          & not (k_sync = k_sync_old)
+          & not (Ex #l. Session_reveal(k_ses, k_sync) @ #l)
+          & not (Ex usk #m. LTKReveal(usk) @ #m)
+      )
+"
+
+/* Forward Secrecy (next). */
+lemma ForwardSecrecy_Next_Group1:
+"
+  All usk #i.
+    LTKReveal(usk) @ #i
+  ==>
+  not ( Ex k_ses k_sync #j.
+          K(<k_ses,k_sync>) @ #j
+          & Ex #k. ECU_Group_KeyReady(ecu2(), group1(), k_ses, k_sync, next()) @ #k
+          & #k < #i
+          & not (Ex #l. Session_reveal(k_ses, k_sync) @ #l)
+      )
+"
+
+end
